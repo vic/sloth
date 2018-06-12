@@ -21,15 +21,12 @@ class Translator[C <: Context](val c: C) {
 
   def abort(msg: String) = c.abort(c.enclosingPosition, msg)
 
-  private def validateMethod(expectedReturnType: Type, symbol: MethodSymbol, methodType: Type): Either[String, (MethodSymbol, Type)] = for {
+  private def validateMethod(symbol: MethodSymbol, methodType: Type): Either[String, (MethodSymbol, Type)] = for {
     _ <- methodType match {
       case _: MethodType | _: NullaryMethodType => Valid
       case _: PolyType => Invalid(s"method ${symbol.name} has type parameters")
       case _ => Invalid(s"method ${symbol.name} has unsupported type")
     }
-    methodResult = methodType.finalResultType.typeConstructor
-    returnResult = expectedReturnType.finalResultType.typeConstructor
-    _ <- validate(methodResult <:< returnResult, s"method ${symbol.name} has invalid return type, required: $methodResult <: $returnResult")
   } yield (symbol, methodType)
 
   //TODO rename overloaded methods to fun1, fun2, fun3 or append TypeSignature instead of number?
@@ -53,9 +50,9 @@ class Translator[C <: Context](val c: C) {
     symbol = member.asMethod
   } yield (symbol, symbol.typeSignatureIn(tpe))
 
-  def supportedMethodsInType(tpe: Type, expectedReturnType: Type): List[(MethodSymbol, Type)] = {
+  def supportedMethodsInType(tpe: Type): List[(MethodSymbol, Type)] = {
     val methods = definedMethodsInType(tpe)
-    val validatedMethods = methods.map { case (sym, tpe) => validateMethod(expectedReturnType, sym, tpe) }
+    val validatedMethods = methods.map { case (sym, tpe) => validateMethod(sym, tpe) }
     val validatedType = eitherSeq(validatedMethods)
       .flatMap(methods => eitherSeq(validateAllMethods(methods)))
 
@@ -111,6 +108,38 @@ class Translator[C <: Context](val c: C) {
       case list => q"""new $typeName(..${params.map(p => q"${p.name.toTermName}")})"""
     }
   }
+
+  def findOuterAndInnerReturnType(tpe: Type): (Type, Type) = tpe.typeArgs match {
+    case Nil => (typeOf[cats.Id[_]].typeConstructor, tpe)
+    case t :: Nil => (tpe.typeConstructor, t)
+    case args =>
+      val concreteArgs = args.zipWithIndex.filterNot(_._1.takesTypeArgs)
+      if (concreteArgs.size == 1) {
+        val (concreteArg, index) = concreteArgs.head
+        val tSym = tpe.typeConstructor.typeParams(index)
+        val tTpe = internal.typeRef(NoPrefix, tSym, Nil)
+        val substituted = appliedType(tpe.typeConstructor, args.updated(index, tTpe))
+        val polyType = c.internal.polyType(tSym :: Nil, substituted)
+        (polyType, concreteArg)
+      } else {
+        //TODO: put into validate method
+        abort(s"Return type '$tpe' of method has multiple fitting type arguments, this is not supported in Api traits. You can workaround this by defining a type alias `F[T] = ${tpe.typeConstructor}[..., T, ...]` and using `F` as return type.")
+      }
+  }
+
+  def inferImplicitResultMapping(from: Type, to: Type): Tree = {
+    val rawMapping = typeOf[sloth.ResultMapping[Any, Any]]
+    val typeArgs = from :: to :: Nil
+    val mapping = internal.typeRef(NoPrefix, rawMapping.typeConstructor.typeSymbol, typeArgs)
+    c.inferImplicitValue(mapping) match {
+      case EmptyTree => abort(s"""Cannot find implicit mapping '$mapping' for occurring result types. Define it with:
+        |  implicit val mapping: $mapping = new $mapping {
+        |    def apply[T](result: $from[T]): $to[T] = ???
+        |  }
+        """.stripMargin)
+      case tree => tree
+    }
+  }
 }
 
 object Translator {
@@ -122,12 +151,12 @@ object Translator {
 }
 
 object TraitMacro {
-  def impl[Trait, PickleType, Result[_], ErrorType]
+  def impl[Trait, PickleType, Result[_]]
     (c: Context)
     (implicit traitTag: c.WeakTypeTag[Trait], resultTag: c.WeakTypeTag[Result[_]]): c.Expr[Trait] = Translator(c) { t =>
     import c.universe._
 
-    val validMethods = t.supportedMethodsInType(traitTag.tpe, resultTag.tpe)
+    val validMethods = t.supportedMethodsInType(traitTag.tpe)
 
     val traitPathPart = t.traitPathPart(traitTag.tpe)
     val (methodImplList, paramsObjects) = validMethods.collect { case (symbol, method) =>
@@ -136,11 +165,14 @@ object TraitMacro {
       val parameters =  t.paramsAsValDefs(method)
       val paramsObject = t.paramsAsObject(method, path)
       val paramListValue = t.newParamsObject(method, path)
-      val innerReturnType = method.finalResultType.typeArgs.head
+      val (outerReturnType, innerReturnType) = t.findOuterAndInnerReturnType(method.finalResultType)
+      val resultMapping = t.inferImplicitResultMapping(from = resultTag.tpe.typeConstructor, to = outerReturnType)
 
       (q"""
         override def ${symbol.name}(...$parameters): ${method.finalResultType} = {
-          impl.execute[${paramsObject.tpe}, $innerReturnType]($path, $paramListValue)
+          val resultMapping = $resultMapping
+          val result = impl.execute[${paramsObject.tpe}, $innerReturnType]($path, $paramListValue)
+          resultMapping(result)
         }
       """, paramsObject.tree)
     }.unzip
@@ -165,7 +197,7 @@ object RouterMacro {
     (implicit traitTag: c.WeakTypeTag[Trait], pickleTypeTag: c.WeakTypeTag[PickleType], resultTag: c.WeakTypeTag[Result[_]]): c.Expr[sloth.Router[PickleType, Result]] = Translator(c) { t =>
     import c.universe._
 
-    val validMethods = t.supportedMethodsInType(traitTag.tpe, resultTag.tpe)
+    val validMethods = t.supportedMethodsInType(traitTag.tpe)
 
     val traitPathPart = t.traitPathPart(traitTag.tpe)
     val (methodTuples, paramsObjects) = validMethods.map { case (symbol, method) =>
@@ -173,11 +205,18 @@ object RouterMacro {
       val path = traitPathPart :: methodPathPart :: Nil
       val paramsObject = t.paramsAsObject(method, path)
       val argParams: List[List[Tree]] = t.objectToParams(method, TermName("args"))
-      val innerReturnType = method.finalResultType.typeArgs.head
+      val (outerReturnType, innerReturnType) = t.findOuterAndInnerReturnType(method.finalResultType)
+      val resultMapping = t.inferImplicitResultMapping(from = outerReturnType, to = resultTag.tpe.typeConstructor)
+
       val payloadFunction =
-        q"""(payload: ${pickleTypeTag.tpe}) => impl.execute[${paramsObject.tpe}, $innerReturnType]($path, payload) { args =>
-          value.${symbol.name.toTermName}(...$argParams)
-        }"""
+        q"""(payload: ${pickleTypeTag.tpe}) => {
+          val resultMapping = $resultMapping
+          impl.execute[${paramsObject.tpe}, $innerReturnType]($path, payload) { args =>
+            val result = value.${symbol.name.toTermName}(...$argParams)
+            resultMapping(result)
+          }
+        }
+        """
 
       (q"($methodPathPart, $payloadFunction)", paramsObject.tree)
     }.unzip

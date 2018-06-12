@@ -1,29 +1,28 @@
 package sloth
 
+import cats.~>
 import sloth.internal.TraitMacro
 
-import cats.MonadError
-
 //TODO: move implicits to wire method
-class Client[PickleType, Result[_], ErrorType](
+class Client[PickleType, Result[_]](
   private[sloth] val transport: RequestTransport[PickleType, Result],
   private[sloth] val logger: LogHandler[Result]
 )(implicit
-  private[sloth] val monad: MonadError[Result, _ >: ErrorType],
-  private[sloth] val failureConverter: ClientFailureConvert[ErrorType]
+  private[sloth] val resultError: ClientResultErrorConverted[Result]
 ) {
 
-  def wire[T]: T = macro TraitMacro.impl[T, PickleType, Result, ErrorType]
+  def wire[T]: T = macro TraitMacro.impl[T, PickleType, Result]
 }
 
 object Client {
-  def apply[PickleType, Result[_], ErrorType : ClientFailureConvert](transport: RequestTransport[PickleType, Result], logger: LogHandler[Result] = LogHandler.empty[Result])(implicit monad: MonadError[Result, _ >: ErrorType]) = new Client[PickleType, Result, ErrorType](transport, logger)
+  def apply[PickleType, Result[_]](transport: RequestTransport[PickleType, Result], logger: LogHandler[Result] = LogHandler.empty[Result])(implicit clientResult: ClientResultError[Result, Throwable]): Client[PickleType, Result] = withError[PickleType, Result, Throwable](transport, logger)
+  def withError[PickleType, Result[_], ErrorType](transport: RequestTransport[PickleType, Result], logger: LogHandler[Result] = LogHandler.empty[Result])(implicit clientResult: ClientResultError[Result, ErrorType], convert: ClientFailureConvert[ErrorType]): Client[PickleType, Result] = new Client(transport, logger)
 }
 
 trait RequestTransport[PickleType, Result[_]] { transport =>
   def apply(request: Request[PickleType]): Result[PickleType]
 
-  final def map[R[_]](f: Result[PickleType] => R[PickleType]): RequestTransport[PickleType, R] = new RequestTransport[PickleType, R] {
+  def mapK[R[_]](f: Result ~> R): RequestTransport[PickleType, R] = new RequestTransport[PickleType, R] {
     def apply(request: Request[PickleType]): R[PickleType] = f(transport(request))
   }
 }
